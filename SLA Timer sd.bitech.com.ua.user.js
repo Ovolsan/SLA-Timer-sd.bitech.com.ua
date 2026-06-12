@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Таймер SLA з урахуванням Часу відправки оповіщення
+// @version      12062026
+// @description  Не повноцінний таймер SLA для sd.bitech. Бере час "Час відправки оповіщення:", враховує умову критичності. Якщо є призупинення, то бере його за основу таймера. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bitech.com.ua
@@ -14,7 +14,15 @@
 (function () {
     'use strict';
 
-    // Универсальный парсер даты из инпута (поддерживает формат ДД.ММ.ГГГГ ЧЧ:ММ)
+    const RULES = {
+        '1.ЗК-1': { hours: 4, hasExclusion: false },
+        '1.ЗК-2': { hours: 8, hasExclusion: false },
+        '2.ЗК-1': { hours: 8, hasExclusion: true, exStart: 0, exEnd: 5 },
+        '2.ЗК-2': { hours: 16, hasExclusion: true, exStart: 0, exEnd: 5 },
+        '3.ЗК-1': { hours: 16, hasExclusion: true, exStart: 20, exEnd: 8 },
+        '3.ЗК-2': { hours: 24, hasExclusion: true, exStart: 20, exEnd: 8 }
+    };
+
     function parseDateString(dateStr) {
         if (!dateStr) return null;
         let match = dateStr.match(/(\d{2})[\.\/](\d{2})[\.\/](\d{4})(?:\s+(\d{2}):(\d{2}))?/);
@@ -25,53 +33,79 @@
         return isNaN(d.getTime()) ? null : d;
     }
 
-    // Логика расчета SLA
-    function calculateSLA(startDateStr, criticality) {
-        let startDate = new Date(startDateStr.replace(' ', 'T'));
-        if (isNaN(startDate.getTime())) return null;
+    function parseSourceDate(dateStr) {
+        if (!dateStr) return null;
+        dateStr = dateStr.trim();
 
-        let hoursToAdd = 0;
-        let excludeNight = false;
-
-        if (criticality === '1.ЗК-1') {
-            hoursToAdd = 4;
-            excludeNight = false;
-        } else if (criticality === '2.ЗК-2') {
-            hoursToAdd = 16;
-            excludeNight = true;
-        } else {
-            return null;
+        if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
+            let d = new Date(dateStr.replace(' ', 'T'));
+            return isNaN(d.getTime()) ? null : d;
         }
 
-        let date = new Date(startDate.getTime());
-        let msToAdd = hoursToAdd * 60 * 60 * 1000;
+        let cleanStr = dateStr.replace(/^[A-Za-z]+,\s*/, '');
+        let d = new Date(cleanStr);
+        return isNaN(d.getTime()) ? null : d;
+    }
 
-        if (!excludeNight) {
+    function isInsideExclusion(d, start, end) {
+        let h = d.getHours();
+        if (start < end) {
+            return h >= start && h < end;
+        } else {
+            return h >= start || h < end;
+        }
+    }
+
+    function jumpToEndOfExclusion(d, start, end) {
+        let h = d.getHours();
+        if (start < end) {
+            d.setHours(end, 0, 0, 0);
+        } else {
+            if (h >= start) {
+                d.setDate(d.getDate() + 1);
+            }
+            d.setHours(end, 0, 0, 0);
+        }
+    }
+
+    function calculateSLAFromDate(startDate, criticality) {
+        let rule = RULES[criticality];
+        if (!rule) return null;
+
+        let date = new Date(startDate.getTime());
+        let msToAdd = rule.hours * 60 * 60 * 1000;
+
+        if (!rule.hasExclusion) {
             return new Date(date.getTime() + msToAdd);
         }
 
         while (msToAdd > 0) {
-            let h = date.getHours();
-            if (h >= 0 && h < 5) {
-                date.setHours(5, 0, 0, 0);
-            } else {
-                let nextMidnight = new Date(date);
-                nextMidnight.setHours(24, 0, 0, 0);
-                let timeToMidnight = nextMidnight.getTime() - date.getTime();
+            if (isInsideExclusion(date, rule.exStart, rule.exEnd)) {
+                jumpToEndOfExclusion(date, rule.exStart, rule.exEnd);
+                continue;
+            }
 
-                if (msToAdd <= timeToMidnight) {
-                    date.setTime(date.getTime() + msToAdd);
-                    msToAdd = 0;
-                } else {
-                    date.setTime(nextMidnight.getTime());
-                    msToAdd -= timeToMidnight;
-                }
+            let nextExclusionStart = new Date(date);
+            nextExclusionStart.setHours(rule.exStart, 0, 0, 0);
+
+            if (nextExclusionStart <= date) {
+                nextExclusionStart.setDate(nextExclusionStart.getDate() + 1);
+            }
+
+            let timeToNextExclusion = nextExclusionStart.getTime() - date.getTime();
+
+            if (msToAdd <= timeToNextExclusion) {
+                date.setTime(date.getTime() + msToAdd);
+                msToAdd = 0;
+            } else {
+                date.setTime(nextExclusionStart.getTime());
+                msToAdd -= timeToNextExclusion;
             }
         }
         return date;
     }
 
-    // Функция для определения целевого времени
+    // ПОЛНОСТЬЮ ОБНОВЛЕННАЯ ФУНКЦИЯ ПОИСКА
     function getTargetTime() {
         const manualInput = document.getElementById('slaDateTimePicker');
         if (manualInput && manualInput.value) {
@@ -79,30 +113,60 @@
             if (manualDate) return manualDate;
         }
 
+        let htmlContent = "";
         const iframe = document.querySelector('iframe.app-iframe');
-        if (!iframe) return null;
 
-        const srcdoc = iframe.getAttribute('srcdoc');
-        if (!srcdoc) return null;
+        if (iframe) {
+            htmlContent = iframe.getAttribute('srcdoc') || "";
+        }
 
-        // Измененная строка поиска: теперь ищет "Час відправки оповіщення:"
-        const timeMatch = srcdoc.match(/\*Час відправки оповіщення:\*\s*(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})/);
-        if (!timeMatch) return null;
-        const startTimeStr = timeMatch[1];
+        // Если iframe пуст, берем код из основного документа
+        if (!htmlContent) {
+            htmlContent = document.body.innerHTML;
+        }
 
-        const checkedRadio = document.querySelector('app-radio-button-group[key="criticality"] p-radiobutton[data-p-checked="true"]');
-        if (!checkedRadio) return null;
+        // Превращаем HTML-верстку в чистый текст, сохраняя переносы строк
+        let textLines = htmlContent
+            .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/td>|<\/tr>/gi, '\n') // Заменяем теги разрыва на \n
+            .replace(/<[^>]+>/g, '') // Удаляем все остальные HTML-теги (например <b>, <body>)
+            .split('\n')             // Разбиваем текст на массив строк
+            .map(line => line.trim()) // Убираем пробелы по краям
+            .filter(line => line.length > 0); // Выбрасываем пустые строки
 
-        const label = checkedRadio.closest('label');
-        if (!label) return null;
+        let dateText = null;
+        let criticalityText = null;
 
-        const span = label.querySelector('.radio-button-label-text');
-        const criticality = span ? span.textContent.trim() : null;
+        // Проходимся по каждой текстовой строке
+        textLines.forEach(line => {
+            if (line.includes('Час відправки оповіщення:')) {
+                // Отрезаем заголовок и удаляем звездочки (если они есть), чтобы осталась только дата
+                dateText = line.split('Час відправки оповіщення:')[1].replace(/\*/g, '').trim();
+            }
+            if (line.includes('Пріоритет:')) {
+                // Ищем критичность в скобках для второго типа заявок
+                let match = line.match(/\(([^)]+)\)/);
+                if (match) criticalityText = match[1];
+            }
+        });
 
-        return calculateSLA(startTimeStr, criticality);
+        // Если в тексте не было слова "Пріоритет:", берем критичность из радиокнопок (для первой заявки)
+        if (!criticalityText) {
+            const checkedRadio = document.querySelector('app-radio-button-group[key="criticality"] p-radiobutton[data-p-checked="true"]');
+            if (checkedRadio) {
+                const label = checkedRadio.closest('label');
+                const span = label ? label.querySelector('.radio-button-label-text') : null;
+                if (span) criticalityText = span.textContent.trim();
+            }
+        }
+
+        if (!dateText || !criticalityText) return null;
+
+        const startTime = parseSourceDate(dateText);
+        if (!startTime) return null;
+
+        return calculateSLAFromDate(startTime, criticalityText);
     }
 
-    // Создание UI таймера в DOM
     function getOrCreateTimerUI() {
         let timerDiv = document.getElementById('my-sla-timer');
         if (!timerDiv) {
@@ -127,7 +191,6 @@
 
             timerDiv.title = 'Натисніть, щоб скопіювати цільовий час';
 
-            // При клике копируем дату
             timerDiv.addEventListener('click', () => {
                 const targetTime = getTargetTime();
                 if (targetTime) {
@@ -152,7 +215,6 @@
         return timerDiv;
     }
 
-    // Обновление значений таймера
     function updateTimer() {
         const targetDate = getTargetTime();
 
