@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      12062026
+// @version      20260612
 // @description  Не повноцінний таймер SLA для sd.bitech. Бере час "Час відправки оповіщення:", враховує умову критичності. Якщо є призупинення, то бере його за основу таймера. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
