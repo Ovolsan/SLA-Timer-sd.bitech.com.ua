@@ -2,7 +2,7 @@
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
 // @version      20260713
-// @description  Не повноцінний таймер SLA для sd.bitech. Бере час "Час відправки оповіщення:", враховує умову критичності. Якщо є призупинення, то бере його за основу таймера. Деталі в гілці discord.
+// @description  Таймер SLA для sd.bitech в нижньому лівому куті блоку історія. Вираховує час в блоці "історія", враховує критичність та всі призупинення. При кліці на таймер копіює час завершення SLA. За дві години до завершення таймера інтерфейс стає червоним. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bitech.com.ua
