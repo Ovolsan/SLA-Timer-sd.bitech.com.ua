@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      20260612
+// @version      20260713
 // @description  Не повноцінний таймер SLA для sd.bitech. Бере час "Час відправки оповіщення:", враховує умову критичності. Якщо є призупинення, то бере його за основу таймера. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
@@ -14,159 +14,178 @@
 (function () {
     'use strict';
 
-    const RULES = {
-        '1.ЗК-1': { hours: 4, hasExclusion: false },
-        '1.ЗК-2': { hours: 8, hasExclusion: false },
-        '2.ЗК-1': { hours: 8, hasExclusion: true, exStart: 0, exEnd: 5 },
-        '2.ЗК-2': { hours: 16, hasExclusion: true, exStart: 0, exEnd: 5 },
-        '3.ЗК-1': { hours: 16, hasExclusion: true, exStart: 20, exEnd: 8 },
-        '3.ЗК-2': { hours: 24, hasExclusion: true, exStart: 20, exEnd: 8 }
+    // Лимиты SLA по критичности (в часах)
+    const SLA_LIMITS = {
+        '1.ЗК-1': 4,
+        '1.ЗК-2': 8,
+        '2.ЗК-1': 8,
+        '2.ЗК-2': 16,
+        '3.ЗК-1': 16,
+        '3.ЗК-2': 24
     };
 
-    function parseDateString(dateStr) {
-        if (!dateStr) return null;
-        let match = dateStr.match(/(\d{2})[\.\/](\d{2})[\.\/](\d{4})(?:\s+(\d{2}):(\d{2}))?/);
+    // Проверка, активна ли вкладка истории
+    function isHistoryTabActive() {
+        const historyPanel = document.querySelector('p-tabpanel[id*="tabpanel_requests_hstr"]');
+        if (!historyPanel) return false;
+
+        // Вкладка активна, если её размеры больше нуля (не скрыта через display: none)
+        const rect = historyPanel.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    // Парсер дат формата DD.MM.YYYY HH:MM
+    function parseDateTime(str) {
+        if (!str) return null;
+        let match = str.trim().match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
         if (match) {
-            return new Date(match[3], match[2] - 1, match[1], match[4] || 0, match[5] || 0, 0);
+            return new Date(match[3], match[2] - 1, match[1], match[4], match[5], 0);
         }
-        let d = new Date(dateStr);
-        return isNaN(d.getTime()) ? null : d;
+        return null;
     }
 
-    function parseSourceDate(dateStr) {
-        if (!dateStr) return null;
-        dateStr = dateStr.trim();
-
-        if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
-            let d = new Date(dateStr.replace(' ', 'T'));
-            return isNaN(d.getTime()) ? null : d;
-        }
-
-        let cleanStr = dateStr.replace(/^[A-Za-z]+,\s*/, '');
-        let d = new Date(cleanStr);
-        return isNaN(d.getTime()) ? null : d;
+    // Форматирование даты в DD.MM.YYYY HH:MM
+    function formatDateTime(date) {
+        if (!date) return '';
+        const day = String(date.getDate()).padStart(2, '0');
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const year = date.getFullYear();
+        const hours = String(date.getHours()).padStart(2, '0');
+        const minutes = String(date.getMinutes()).padStart(2, '0');
+        return `${day}.${month}.${year} ${hours}:${minutes}`;
     }
 
-    function isInsideExclusion(d, start, end) {
-        let h = d.getHours();
-        if (start < end) {
-            return h >= start && h < end;
-        } else {
-            return h >= start || h < end;
-        }
+    // Чтение истории изменений напрямую из сетки интерфейса
+    function parseHistoryData() {
+        const historyPanel = document.querySelector('p-tabpanel[id*="tabpanel_requests_hstr"]');
+        if (!historyPanel) return null;
+
+        let creationTime = null;
+        let events = [];
+
+        // Ищем все строки (события) в таблице истории
+        const rows = historyPanel.querySelectorAll('tbody.p-datatable-tbody > tr');
+
+        rows.forEach(row => {
+            let currentEventTime = null;
+
+            // Время возникновения записи (извлекается из тега <small>)
+            const timeEl = row.querySelector('small');
+            if (timeEl) {
+                let dateMatch = timeEl.textContent.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
+                if (dateMatch) {
+                    currentEventTime = parseDateTime(dateMatch[0]);
+                }
+            }
+
+            // Находим все блоки-названия полей (класс col-4)
+            const keyCols = row.querySelectorAll('.md\\:col-4');
+
+            keyCols.forEach(keyCol => {
+                // Значение поля всегда лежит в соседнем блоке
+                const valCol = keyCol.nextElementSibling;
+                if (!valCol || !valCol.classList.contains('md:col-8')) return;
+
+                let keyText = keyCol.textContent.trim();
+                let valText = valCol.textContent.trim();
+
+                // Ищем время создания
+                if (keyText === 'Дата й час створення') {
+                    let match = valText.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
+                    if (match) creationTime = parseDateTime(match[0]);
+                }
+
+                // Ищем смену критичности
+                if (keyText === 'Критичність') {
+                    let critMatch = valText.match(/(1|2|3)\.ЗК\-(1|2)/);
+                    if (critMatch) {
+                        events.push({
+                            time: currentEventTime || creationTime,
+                            type: 'criticality',
+                            value: critMatch[0]
+                        });
+                    }
+                }
+
+                // Ищем приостановку
+                if (keyText.includes('SLA призупинено до')) {
+                    let pauseMatch = valText.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
+                    if (pauseMatch && currentEventTime) {
+                        events.push({
+                            time: currentEventTime,
+                            type: 'suspension',
+                            suspendedTo: parseDateTime(pauseMatch[0])
+                        });
+                    }
+                }
+            });
+        });
+
+        if (!creationTime) return null;
+        return { creationTime, events };
     }
 
-    function jumpToEndOfExclusion(d, start, end) {
-        let h = d.getHours();
-        if (start < end) {
-            d.setHours(end, 0, 0, 0);
-        } else {
-            if (h >= start) {
-                d.setDate(d.getDate() + 1);
+    // Расчет SLA с учетом пауз
+    function calculateSLA() {
+        const history = parseHistoryData();
+        if (!history) return null;
+
+        const { creationTime, events } = history;
+        const now = new Date();
+
+        let activeCriticality = null;
+        let suspensions = [];
+
+        // Упорядочиваем по времени
+        events.sort((a, b) => a.time - b.time);
+
+        events.forEach(ev => {
+            if (ev.type === 'criticality') {
+                activeCriticality = ev.value;
             }
-            d.setHours(end, 0, 0, 0);
-        }
-    }
-
-    function calculateSLAFromDate(startDate, criticality) {
-        let rule = RULES[criticality];
-        if (!rule) return null;
-
-        let date = new Date(startDate.getTime());
-        let msToAdd = rule.hours * 60 * 60 * 1000;
-
-        if (!rule.hasExclusion) {
-            return new Date(date.getTime() + msToAdd);
-        }
-
-        while (msToAdd > 0) {
-            if (isInsideExclusion(date, rule.exStart, rule.exEnd)) {
-                jumpToEndOfExclusion(date, rule.exStart, rule.exEnd);
-                continue;
-            }
-
-            let nextExclusionStart = new Date(date);
-            nextExclusionStart.setHours(rule.exStart, 0, 0, 0);
-
-            if (nextExclusionStart <= date) {
-                nextExclusionStart.setDate(nextExclusionStart.getDate() + 1);
-            }
-
-            let timeToNextExclusion = nextExclusionStart.getTime() - date.getTime();
-
-            if (msToAdd <= timeToNextExclusion) {
-                date.setTime(date.getTime() + msToAdd);
-                msToAdd = 0;
-            } else {
-                date.setTime(nextExclusionStart.getTime());
-                msToAdd -= timeToNextExclusion;
-            }
-        }
-        return date;
-    }
-
-    // ПОЛНОСТЬЮ ОБНОВЛЕННАЯ ФУНКЦИЯ ПОИСКА
-    function getTargetTime() {
-        const manualInput = document.getElementById('slaDateTimePicker');
-        if (manualInput && manualInput.value) {
-            let manualDate = parseDateString(manualInput.value);
-            if (manualDate) return manualDate;
-        }
-
-        let htmlContent = "";
-        const iframe = document.querySelector('iframe.app-iframe');
-
-        if (iframe) {
-            htmlContent = iframe.getAttribute('srcdoc') || "";
-        }
-
-        // Если iframe пуст, берем код из основного документа
-        if (!htmlContent) {
-            htmlContent = document.body.innerHTML;
-        }
-
-        // Превращаем HTML-верстку в чистый текст, сохраняя переносы строк
-        let textLines = htmlContent
-            .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/td>|<\/tr>/gi, '\n') // Заменяем теги разрыва на \n
-            .replace(/<[^>]+>/g, '') // Удаляем все остальные HTML-теги (например <b>, <body>)
-            .split('\n')             // Разбиваем текст на массив строк
-            .map(line => line.trim()) // Убираем пробелы по краям
-            .filter(line => line.length > 0); // Выбрасываем пустые строки
-
-        let dateText = null;
-        let criticalityText = null;
-
-        // Проходимся по каждой текстовой строке
-        textLines.forEach(line => {
-            if (line.includes('Час відправки оповіщення:')) {
-                // Отрезаем заголовок и удаляем звездочки (если они есть), чтобы осталась только дата
-                dateText = line.split('Час відправки оповіщення:')[1].replace(/\*/g, '').trim();
-            }
-            if (line.includes('Пріоритет:')) {
-                // Ищем критичность в скобках для второго типа заявок
-                let match = line.match(/\(([^)]+)\)/);
-                if (match) criticalityText = match[1];
+            if (ev.type === 'suspension' && ev.suspendedTo) {
+                suspensions.push({ start: ev.time, end: ev.suspendedTo });
             }
         });
 
-        // Если в тексте не было слова "Пріоритет:", берем критичность из радиокнопок (для первой заявки)
-        if (!criticalityText) {
-            const checkedRadio = document.querySelector('app-radio-button-group[key="criticality"] p-radiobutton[data-p-checked="true"]');
-            if (checkedRadio) {
-                const label = checkedRadio.closest('label');
-                const span = label ? label.querySelector('.radio-button-label-text') : null;
-                if (span) criticalityText = span.textContent.trim();
-            }
+        if (!activeCriticality) {
+            activeCriticality = '2.ЗК-2';
         }
 
-        if (!dateText || !criticalityText) return null;
+        const limitHours = SLA_LIMITS[activeCriticality] || 8;
+        const slaLimitMs = limitHours * 60 * 60 * 1000;
 
-        const startTime = parseSourceDate(dateText);
-        if (!startTime) return null;
+        let totalSuspensionMs = 0;
 
-        return calculateSLAFromDate(startTime, criticalityText);
+        // Разбор сложных цепей пауз
+        if (suspensions.length > 0) {
+            suspensions.sort((a, b) => a.start - b.start);
+            let currentChain = { start: suspensions[0].start, end: suspensions[0].end };
+
+            for (let i = 1; i < suspensions.length; i++) {
+                let next = suspensions[i];
+                if (next.start <= currentChain.end) {
+                    if (next.end > currentChain.end) {
+                        currentChain.end = next.end; // Продление
+                    }
+                } else {
+                    totalSuspensionMs += (currentChain.end - currentChain.start); // Обрыв цепочки
+                    currentChain = { start: next.start, end: next.end }; // Новая цепочка
+                }
+            }
+            totalSuspensionMs += (currentChain.end - currentChain.start); // Завершение финальной цепи
+        }
+
+        const elapsedMs = now.getTime() - creationTime.getTime();
+        const remainingMs = slaLimitMs - elapsedMs + totalSuspensionMs;
+
+        // Точная дата дедлайна SLA
+        const deadlineDate = new Date(creationTime.getTime() + slaLimitMs + totalSuspensionMs);
+
+        return { remainingMs, deadlineDate };
     }
 
+    // Отрисовка UI
     function getOrCreateTimerUI() {
         let timerDiv = document.getElementById('my-sla-timer');
         if (!timerDiv) {
@@ -175,39 +194,43 @@
 
             Object.assign(timerDiv.style, {
                 position: 'fixed',
-                top: '45px',
-                right: '10px',
+                bottom: '10px', // Левый нижний угол
+                left: '10px',   // Левый нижний угол
                 zIndex: 9999,
                 cursor: 'pointer',
                 fontWeight: 'bold',
                 padding: '6px 12px',
                 borderRadius: '6px',
-                display: 'inline-block',
-                transition: '0.3s',
+                display: 'none', // Изначально скрыт, пока не подтвердится вкладка истории
+                transition: 'background-color 0.15s ease',
                 fontSize: '13px',
                 userSelect: 'none',
                 boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
             });
 
-            timerDiv.title = 'Натисніть, щоб скопіювати цільовий час';
-
+            // Копирование ДАТЫ И ВРЕМЕНИ ДЕДЛАЙНА в буфер обмена по клику
             timerDiv.addEventListener('click', () => {
-                const targetTime = getTargetTime();
-                if (targetTime) {
-                    const d = String(targetTime.getDate()).padStart(2, '0');
-                    const m = String(targetTime.getMonth() + 1).padStart(2, '0');
-                    const y = targetTime.getFullYear();
-                    const h = String(targetTime.getHours()).padStart(2, '0');
-                    const min = String(targetTime.getMinutes()).padStart(2, '0');
+                const deadlineText = timerDiv.getAttribute('data-deadline');
+                if (!deadlineText) return;
 
-                    const formattedDate = `${d}.${m}.${y} ${h}:${min}`;
+                navigator.clipboard.writeText(deadlineText).then(() => {
+                    const originalBg = timerDiv.style.backgroundColor;
+                    const originalBorder = timerDiv.style.borderColor;
+                    const originalColor = timerDiv.style.color;
 
-                    navigator.clipboard.writeText(formattedDate).then(() => {
-                        const originalText = timerDiv.innerHTML;
-                        timerDiv.innerHTML = "Скопійовано!";
-                        setTimeout(() => { timerDiv.innerHTML = originalText; }, 1000);
-                    });
-                }
+                    // Вспышка зеленым цветом при успешном копировании
+                    timerDiv.style.backgroundColor = '#1e7e34';
+                    timerDiv.style.borderColor = '#1e7e34';
+                    timerDiv.style.color = '#ffffff';
+
+                    setTimeout(() => {
+                        timerDiv.style.backgroundColor = originalBg;
+                        timerDiv.style.borderColor = originalBorder;
+                        timerDiv.style.color = originalColor;
+                    }, 300);
+                }).catch(err => {
+                    console.error('Не удалось скопировать текст: ', err);
+                });
             });
 
             document.body.appendChild(timerDiv);
@@ -215,23 +238,42 @@
         return timerDiv;
     }
 
+    // Цикл таймера
     function updateTimer() {
-        const targetDate = getTargetTime();
+        const timerDiv = getOrCreateTimerUI();
 
-        if (!targetDate) {
-            const existingTimer = document.getElementById('my-sla-timer');
-            if (existingTimer) existingTimer.style.display = 'none';
+        // Если мы не на вкладке истории, полностью скрываем таймер
+        if (!isHistoryTabActive()) {
+            timerDiv.style.display = 'none';
             return;
         }
 
-        const timerDiv = getOrCreateTimerUI();
+        // Показываем таймер, если вкладка активна
         timerDiv.style.display = 'inline-block';
 
-        const now = new Date();
-        const diffMs = targetDate.getTime() - now.getTime();
+        const slaData = calculateSLA();
 
-        const isOverdue = diffMs < 0;
-        const absDiff = Math.abs(diffMs);
+        // Если цвет временно изменен (активна анимация копирования) — не прерываем её стилями обновления
+        const isFlashing = timerDiv.style.backgroundColor === 'rgb(30, 126, 52)';
+
+        if (slaData === null) {
+            timerDiv.innerHTML = `Відкрийте історію`;
+            timerDiv.removeAttribute('data-deadline');
+            if (!isFlashing) {
+                timerDiv.style.backgroundColor = '#555';
+                timerDiv.style.color = '#fff';
+                timerDiv.style.border = '1px solid #777';
+            }
+            return;
+        }
+
+        const { remainingMs, deadlineDate } = slaData;
+
+        // Записываем форматированную дату дедлайна в data-атрибут для копирования
+        timerDiv.setAttribute('data-deadline', formatDateTime(deadlineDate));
+
+        const isOverdue = remainingMs < 0;
+        const absDiff = Math.abs(remainingMs);
 
         const h = Math.floor(absDiff / (1000 * 60 * 60));
         const m = Math.floor((absDiff % (1000 * 60 * 60)) / (1000 * 60));
@@ -239,16 +281,20 @@
         const sign = isOverdue ? '-' : '';
         const timeString = `${sign}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 
-        timerDiv.innerHTML = `SLA: ${timeString}`;
+        timerDiv.innerHTML = timeString;
 
-        if (isOverdue) {
-            timerDiv.style.backgroundColor = '#4a0000';
-            timerDiv.style.color = '#ffcccc';
-            timerDiv.style.border = '1px solid #ff4d4d';
-        } else {
-            timerDiv.style.backgroundColor = '#26282f';
-            timerDiv.style.color = '#ccffcc';
-            timerDiv.style.border = '1px solid #33cc33';
+        if (!isFlashing) {
+            // Меняет цвет за 2 часа (7200000 мс) до конца SLA
+            const twoHoursMs = 2 * 60 * 60 * 1000;
+            if (remainingMs <= twoHoursMs) {
+                timerDiv.style.backgroundColor = '#4a0000';
+                timerDiv.style.color = '#ffcccc';
+                timerDiv.style.border = '1px solid #ff4d4d';
+            } else {
+                timerDiv.style.backgroundColor = '#26282f';
+                timerDiv.style.color = '#ccffcc';
+                timerDiv.style.border = '1px solid #33cc33';
+            }
         }
     }
 
