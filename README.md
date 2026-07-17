@@ -1,5 +1,6 @@
 # SLA-Timer-sd.bitech.com.ua
-Таймер SLA для sd.bitech. Деталі в гілці discord. Деталі та обговорення в гілці discord. Ну або тут 😺.
+Таймер SLA для sd.bitech. Не забувайте оновлювати таймери на початку зміни та після оновлень SLA.
+Деталі в гілці discord. Деталі та обговорення в гілці discord. Ну або тут 😺.
 
 На зараз:
 - відображається на сторінці заявок коло статусу, в самій заявці на всіх блоках;
@@ -9,8 +10,9 @@
 - є індикація кольором, зеленим виділяється актуальний час, червоним — прострочений, а також проміжок у дві години до завершення; 
 - час показує динамічно, оновлює раз в хвилину.
 
+<img width="1143" height="427" alt="ksnip_20260718-010648" src="https://github.com/user-attachments/assets/2f654c27-d5a1-4a9c-b345-d8f7712e0eab" />
+<img width="335" height="218" alt="изображение" src="https://github.com/user-attachments/assets/63f2e903-f501-4123-b158-e65db7521f1d" />
+<img width="374" height="148" alt="изображение" src="https://github.com/user-attachments/assets/7f406f62-2062-4f36-abff-90e4246e2250" />
 
-<img width="480" height="302" alt="изображение" src="https://github.com/user-attachments/assets/d2811eb6-2393-428e-95f0-06f083b73ea8" />
-<img width="646" height="420" alt="изображение" src="https://github.com/user-attachments/assets/70d1be1b-3c15-472e-8c1d-21cbc47dfe29" />
 
 В планах залишилось ще чищення кешу від давніх записів. 
