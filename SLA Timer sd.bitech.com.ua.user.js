@@ -506,6 +506,7 @@
                 timerSpan = document.createElement('span');
                 timerSpan.className = 'list-sla-timer';
                 timerSpan.dataset.ticketId = ticketId;
+// ТУТ НАЛАШТОВУЄМО ДИЗАЙН ТА РОЗТАШУВАННЯ ТАЙМЕРА В СПИСКУ ЗАЯВОК
                 Object.assign(timerSpan.style, {
                     position: 'absolute', right: '96%', bottom: '-3px', zIndex: '10',
                     padding: '2px 5px', fontSize: '12px', fontWeight: 'bold', border: '1px solid'
