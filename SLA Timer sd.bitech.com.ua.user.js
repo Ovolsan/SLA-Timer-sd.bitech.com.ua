@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      20260718
-// @description  Таймер SLA для sd.bitech. Відображається на сторінці заявок коло статусу, в самій заявці на всіх блоках. Кнопка оновлення з'являється тільки в історії та розташована над таймером. Вираховує час в блоці "історія", враховує критичність та всі призупинення. При кліку на таймер копіює час завершення SLA. За дві години до завершення таймера інтерфейс таймера стає червоним. Деталі в гілці discord.
+// @version      20260804
+// @description  Таймер SLA для sd.bitech. Відображається на сторінці заявок коло статусу, в самій заявці в лівому меню та у списку заявок. Повністю прибирає стовпець "Таймер задачі". Вираховує час в блоці "історія", враховує критичність та всі призупинення. При кліку на таймер копіює час завершення SLA. За дві години до завершення таймера інтерфейс таймера стає червоним. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bitech.com.ua
@@ -16,16 +16,17 @@
 
     // --- КОНСТАНТИ ---
     const SLA_LIMITS = {
-        '1.ЗК-1': 4,
-        '1.ЗК-2': 8,
-        '2.ЗК-1': 8,
-        '2.ЗК-2': 16,
-        '3.ЗК-1': 16,
-        '3.ЗК-2': 24
+        '1.ЗК-1': 4, '1.ЗК-2': 8,
+        '2.ЗК-1': 8, '2.ЗК-2': 16,
+        '3.ЗК-1': 16, '3.ЗК-2': 24
     };
+    const CLEANUP_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
 
     // --- БАЗОВІ ФУНКЦІЇ ---
     function getTicketId() {
+        const urlMatch = window.location.pathname.match(/\/admin\/requests\/(\d+)/);
+        if (urlMatch) return urlMatch[1];
         const breadcrumb = document.querySelector('.p-breadcrumb-list');
         if (!breadcrumb) return null;
         const link = breadcrumb.querySelector('a[href*="/admin/requests/"]');
@@ -34,23 +35,12 @@
         return match ? match[1] : null;
     }
 
-    function isTicketPage() {
-        return !!getTicketId();
-    }
-
-    function isHistoryTabActive() {
-        const historyPanel = document.querySelector('p-tabpanel[id*="tabpanel_requests_hstr"]');
-        if (!historyPanel) return false;
-        const rect = historyPanel.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    }
+    function isTicketPage() { return !!getTicketId(); }
 
     function parseDateTime(str) {
         if (!str) return null;
         let match = str.trim().match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
-        if (match) {
-            return new Date(match[3], match[2] - 1, match[1], match[4], match[5], 0);
-        }
+        if (match) return new Date(match[3], match[2] - 1, match[1], match[4], match[5], 0);
         return null;
     }
 
@@ -64,9 +54,32 @@
         return `${day}.${month}.${year} ${hours}:${minutes}`;
     }
 
-    // --- ЛОГІКА СТОРІНКИ ЗАЯВКИ (ПІДРАХУНОК ТА ПАРСИНГ) ---
+    // --- ОЧИЩЕННЯ СТАРИХ SLA-ЗАПИСІВ ---
+    function cleanupOldSlaData() {
+        try {
+            const now = Date.now();
+            const keysToRemove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith('slaData_')) {
+                    try {
+                        const data = JSON.parse(localStorage.getItem(key));
+                        if (data && data.deadline && data.deadline < now) keysToRemove.push(key);
+                    } catch (e) { keysToRemove.push(key); }
+                }
+            }
+            keysToRemove.forEach(key => localStorage.removeItem(key));
+            if (keysToRemove.length > 0) console.log(`[SLA Timer] Видалено ${keysToRemove.length} прострочених SLA-записів.`);
+        } catch (e) { console.warn('[SLA Timer] Помилка очищення localStorage:', e); }
+    }
+
+    cleanupOldSlaData();
+    setInterval(cleanupOldSlaData, CLEANUP_INTERVAL_MS);
+
+    // --- ПАРСИНГ ІСТОРІЇ ТА РОЗРАХУНОК SLA ---
     function parseHistoryData() {
-        const historyPanel = document.querySelector('p-tabpanel[id*="tabpanel_requests_hstr"]');
+        const historyPanel = document.querySelector('app-requests_hstr-list') ||
+                             document.querySelector('p-tabpanel[id*="tabpanel_requests_hstr"]');
         if (!historyPanel) return null;
 
         let creationTime = null;
@@ -90,20 +103,19 @@
                 let keyText = keyCol.textContent.trim();
                 let valText = valCol.textContent.trim();
 
-                if (keyText === 'Дата й час створення') {
+                if (keyText === 'Дата й час створення' || keyText === 'Дата и время создания') {
                     let match = valText.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
                     if (match) creationTime = parseDateTime(match[0]);
                 }
 
-                if (keyText === 'Критичність') {
+                if (keyText === 'Критичність' || keyText === 'Критичность') {
                     let critMatch = valText.match(/(1|2|3)\.ЗК\-(1|2)/);
                     if (critMatch && !latestCriticality) {
-                        // Беремо перше співпадіння (найновіше в історії)
                         latestCriticality = critMatch[0];
                     }
                 }
 
-                if (keyText.includes('SLA призупинено до')) {
+                if (keyText.includes('SLA призупинено до') || keyText.includes('SLA приостановлено до')) {
                     let pauseMatch = valText.match(/(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})/);
                     if (pauseMatch && currentEventTime) {
                         events.push({ time: currentEventTime, type: 'suspension', suspendedTo: parseDateTime(pauseMatch[0]) });
@@ -121,8 +133,6 @@
         if (!history) return null;
 
         const { creationTime, events, latestCriticality } = history;
-
-        // Якщо критичності немає взагалі - повертаємо спеціальний об'єкт
         if (!latestCriticality) return { noSLA: true };
 
         let suspensions = [];
@@ -151,308 +161,392 @@
             totalSuspensionMs += (currentChain.end - currentChain.start);
         }
 
-        const now = new Date();
-        const elapsedMs = now.getTime() - creationTime.getTime();
-        const remainingMs = slaLimitMs - elapsedMs + totalSuspensionMs;
         const deadlineDate = new Date(creationTime.getTime() + slaLimitMs + totalSuspensionMs);
-
-        return { remainingMs, deadlineDate };
+        return { remainingMs: deadlineDate - Date.now(), deadlineDate };
     }
 
-    // --- ІНТЕРФЕЙС НА СТОРІНЦІ ЗАЯВКИ ---
+    function saveSlaData(ticketId) {
+        const slaData = calculateSLA();
+        if (!slaData) return false;
+        const storageKey = `slaData_${ticketId}`;
+        if (slaData.noSLA) {
+            localStorage.removeItem(storageKey);
+        } else {
+            localStorage.setItem(storageKey, JSON.stringify({ deadline: slaData.deadlineDate.getTime() }));
+        }
+        return true;
+    }
+
+    // --- UI ТАЙМЕРА В ЗАЯВЦІ ---
+    let autoSaveInterval = null;
+
     function getOrCreateTimerUI() {
         let container = document.getElementById('my-sla-container');
-        if (!container) {
-            container = document.createElement('div');
-            container.id = 'my-sla-container';
-            Object.assign(container.style, {
-                position: 'fixed', bottom: '10px', left: '10px', zIndex: 9999,
-                display: 'none', flexDirection: 'column', gap: '6px', alignItems: 'center'
+        if (container) return container;
+
+        container = document.createElement('div');
+        container.id = 'my-sla-container';
+        Object.assign(container.style, {
+            display: 'inline-flex', position: 'relative', alignItems: 'center', zIndex: 99
+        });
+
+        const timerDiv = document.createElement('div');
+        timerDiv.id = 'my-sla-timer';
+        Object.assign(timerDiv.style, {
+            fontWeight: 'bold', borderRadius: '0px',
+            transition: 'background-color 0.15s ease', fontSize: '13px', userSelect: 'none',
+            boxShadow: '0 2px 5px rgba(0,0,0,0.2)', textAlign: 'center', height: '26px', width: '100%',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', boxSizing: 'border-box',
+            border: 'none', position: 'relative', overflow: 'hidden', cursor: 'pointer'
+        });
+
+        const textSpan = document.createElement('span');
+        textSpan.id = 'my-sla-timer-text';
+        textSpan.style.position = 'relative';
+        textSpan.style.zIndex = '2';
+        timerDiv.appendChild(textSpan);
+
+        // Слой с кнопками (появляется при наведении, если есть сохранённые данные)
+        const actionsDiv = document.createElement('div');
+        actionsDiv.className = 'sla-timer-actions';
+        Object.assign(actionsDiv.style, {
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            display: 'flex', justifyContent: 'space-around', alignItems: 'center',
+            opacity: '0', transition: 'opacity 0.2s ease',
+            pointerEvents: 'none', zIndex: '3', background: 'rgba(0,0,0,0.5)'
+        });
+
+        const refreshBtn = document.createElement('button');
+        refreshBtn.innerHTML = '⟳';
+        refreshBtn.title = 'Оновити SLA';
+        const copyBtn = document.createElement('button');
+        copyBtn.innerHTML = '⧉';
+        copyBtn.title = 'Копіювати дедлайн';
+        [refreshBtn, copyBtn].forEach(btn => {
+            Object.assign(btn.style, {
+                background: 'transparent', border: 'none', color: '#fff', fontSize: '18px',
+                cursor: 'pointer', padding: '0', lineHeight: 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', width: '50%', height: '100%'
             });
+        });
 
-            const saveBtn = document.createElement('button');
-            saveBtn.id = 'my-sla-save-btn';
-            saveBtn.title = 'Оновити та зберегти';
-            saveBtn.innerHTML = `
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M23 4v6h-6"></path>
-                    <path d="M1 20v-6h6"></path>
-                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-                </svg>
-            `;
-            Object.assign(saveBtn.style, {
-                padding: '0', width: '32px', height: '32px', borderRadius: '6px',
-                cursor: 'pointer', background: '#26282f', border: '1px solid #555',
-                boxShadow: '0 2px 5px rgba(0,0,0,0.2)', transition: 'background-color 0.15s ease', outline: 'none',
-                display: 'flex', alignItems: 'center', justifyContent: 'center'
-            });
+        actionsDiv.appendChild(refreshBtn);
+        actionsDiv.appendChild(copyBtn);
+        timerDiv.appendChild(actionsDiv);
 
-            saveBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const ticketId = getTicketId();
-                if (!ticketId) return;
+        // Показываем кнопки при наведении
+        timerDiv.addEventListener('mouseenter', () => {
+            const id = getTicketId();
+            if ((id && localStorage.getItem(`slaData_${id}`)) || timerDiv.hasAttribute('data-deadline')) {
+                actionsDiv.style.opacity = '1';
+                actionsDiv.style.pointerEvents = 'auto';
+            }
+        });
+        timerDiv.addEventListener('mouseleave', () => {
+            actionsDiv.style.opacity = '0';
+            actionsDiv.style.pointerEvents = 'none';
+        });
 
-                if (!isHistoryTabActive()) return;
+        refreshBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const id = getTicketId();
+            if (!id) return;
+            if (saveSlaData(id)) {
+                refreshBtn.style.color = '#1e7e34';
+                setTimeout(() => { refreshBtn.style.color = '#fff'; }, 300);
+                updateMainTimer();
+                updateListTimers();
+            } else {
+                navigateToHistoryAndSave();
+            }
+        });
 
-                const slaData = calculateSLA();
-                if (slaData) {
-                    const storageKey = `slaData_${ticketId}`;
-
-                    if (slaData.noSLA) {
-                        localStorage.removeItem(storageKey);
-                    } else {
-                        localStorage.setItem(storageKey, JSON.stringify({ deadline: slaData.deadlineDate.getTime() }));
-                    }
-
-                    const originalBg = saveBtn.style.backgroundColor;
-                    saveBtn.style.backgroundColor = '#1e7e34';
-                    setTimeout(() => { saveBtn.style.backgroundColor = originalBg; }, 300);
-
-                    updateTimer();
-                    updateListTimers();
-                }
-            });
-
-            const timerDiv = document.createElement('div');
-            timerDiv.id = 'my-sla-timer';
-            Object.assign(timerDiv.style, {
-                cursor: 'pointer', fontWeight: 'bold', padding: '7px 12px', borderRadius: '6px',
-                transition: 'background-color 0.15s ease', fontSize: '13px', userSelect: 'none',
-                boxShadow: '0 2px 5px rgba(0,0,0,0.3)', textAlign: 'center', height: '32px',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', boxSizing: 'border-box'
-            });
-
-            timerDiv.addEventListener('click', () => {
-                const deadlineText = timerDiv.getAttribute('data-deadline');
-                if (!deadlineText) return;
+        copyBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const deadlineText = timerDiv.getAttribute('data-deadline');
+            if (deadlineText) {
                 navigator.clipboard.writeText(deadlineText).then(() => {
-                    const originalBg = timerDiv.style.backgroundColor;
-                    const originalBorder = timerDiv.style.borderColor;
-                    const originalColor = timerDiv.style.color;
-
-                    timerDiv.style.backgroundColor = '#1e7e34';
-                    timerDiv.style.borderColor = '#1e7e34';
-                    timerDiv.style.color = '#ffffff';
-
-                    setTimeout(() => {
-                        timerDiv.style.backgroundColor = originalBg;
-                        timerDiv.style.borderColor = originalBorder;
-                        timerDiv.style.color = originalColor;
-                    }, 300);
+                    copyBtn.style.color = '#1e7e34';
+                    setTimeout(() => { copyBtn.style.color = '#fff'; }, 300);
                 }).catch(err => console.error('Помилка копіювання: ', err));
-            });
+            }
+        });
 
-            container.appendChild(saveBtn);
-            container.appendChild(timerDiv);
-            document.body.appendChild(container);
-        }
+        timerDiv.addEventListener('click', (e) => {
+            if (e.target.closest('button')) return;
+            const id = getTicketId();
+            if (!id) return;
+            const hasData = localStorage.getItem(`slaData_${id}`);
+            if (!hasData && !timerDiv.hasAttribute('data-deadline')) {
+                navigateToHistoryAndSave();
+            } else {
+                const deadline = timerDiv.getAttribute('data-deadline');
+                if (deadline) navigator.clipboard.writeText(deadline).catch(() => {});
+            }
+        });
+
+        container.appendChild(timerDiv);
         return container;
     }
 
-    function updateTimer() {
-        const container = getOrCreateTimerUI();
-        const timerDiv = document.getElementById('my-sla-timer');
-        const saveBtn = document.getElementById('my-sla-save-btn');
+    // --- ПЕРЕХІД В ІСТОРІЮ З АВТОЗБЕРЕЖЕННЯМ ---
+    function navigateToHistoryAndSave() {
+        console.log('[SLA Timer] Перехід на вкладку Історія...');
+        let tab = document.querySelector('a[href*="tab=requests_hstr"]');
+        if (!tab) {
+            const candidates = document.querySelectorAll('.p-tabview-nav-link, .nav-link, a[role="tab"], li[role="presentation"] a');
+            for (let t of candidates) {
+                if (t.textContent.trim() === 'Історія' || t.textContent.trim() === 'История') {
+                    tab = t;
+                    break;
+                }
+            }
+        }
+        if (tab) {
+            tab.click();
+            let attempts = 0;
+            if (autoSaveInterval) clearInterval(autoSaveInterval);
+            autoSaveInterval = setInterval(() => {
+                const id = getTicketId();
+                if (parseHistoryData() && saveSlaData(id)) {
+                    clearInterval(autoSaveInterval);
+                    autoSaveInterval = null;
+                    console.log('[SLA Timer] Автоматичне збереження SLA виконано');
+                    updateMainTimer();
+                    updateListTimers();
+                }
+                attempts++;
+                if (attempts > 20) {
+                    clearInterval(autoSaveInterval);
+                    autoSaveInterval = null;
+                    console.warn('[SLA Timer] Не вдалося автоматично зберегти SLA після переходу');
+                }
+            }, 500);
+        } else {
+            console.warn('[SLA Timer] Вкладку не знайдено, переходимо через URL');
+            const url = new URL(location);
+            url.searchParams.set('tab', 'requests_hstr');
+            location.href = url;
+        }
+    }
 
+    // --- ОБНОВЛЕНИЕ ТАЙМЕРА НА СТРАНИЦЕ ЗАЯВКИ ---
+    function updateMainTimer() {
         const ticketId = getTicketId();
+        const container = getOrCreateTimerUI();
         if (!ticketId) {
             container.style.display = 'none';
             return;
         }
 
+        const aside = document.querySelector('aside.dpl-aside');
+        const group = aside?.querySelector('.dpl-aside-group:nth-child(2)') ?? aside?.querySelector('.dpl-aside-group');
+        if (group && !group.contains(container)) {
+            container.style.margin = '15px 0';
+            container.style.flexDirection = 'column';
+            container.style.gap = '8px';
+            container.style.width = '100%';
+            container.style.padding = '0';
+            container.style.boxSizing = 'border-box';
+            container.style.flex = '1 1 auto';
+            const timerDiv = container.querySelector('#my-sla-timer');
+            if (timerDiv) { timerDiv.style.width = '100%'; timerDiv.style.padding = '0'; }
+            group.appendChild(container);
+        }
         container.style.display = 'flex';
 
-        if (saveBtn) {
-            saveBtn.style.display = isHistoryTabActive() ? 'flex' : 'none';
-        }
+        const timerDiv = container.querySelector('#my-sla-timer');
+        const textSpan = container.querySelector('#my-sla-timer-text');
+        const refreshBtn = container.querySelector('.sla-btn-refresh');
+        const copyBtn = container.querySelector('.sla-btn-copy');
+        if (!timerDiv || !textSpan) return;
 
         let slaData = null;
         const storageKey = `slaData_${ticketId}`;
 
-        if (isHistoryTabActive()) {
-            const freshData = calculateSLA();
-            if (freshData) slaData = freshData;
+        if (document.querySelector('app-requests_hstr-list, p-tabpanel[id*="tabpanel_requests_hstr"]')) {
+            const fresh = calculateSLA();
+            if (fresh) {
+                slaData = fresh;
+                saveSlaData(ticketId);
+            }
         }
 
         if (!slaData) {
-            const savedData = localStorage.getItem(storageKey);
-            if (savedData) {
+            const saved = localStorage.getItem(storageKey);
+            if (saved) {
                 try {
-                    const { deadline } = JSON.parse(savedData);
-                    const remainingMs = deadline - new Date().getTime();
-                    slaData = { remainingMs, deadlineDate: new Date(deadline) };
-                } catch (e) {
-                    console.error('Помилка читання з кешу', e);
-                }
+                    const { deadline } = JSON.parse(saved);
+                    slaData = { remainingMs: deadline - Date.now(), deadlineDate: new Date(deadline) };
+                } catch (e) {}
             }
         }
 
         const isFlashing = timerDiv.style.backgroundColor === 'rgb(30, 126, 52)';
 
         if (!slaData) {
-            timerDiv.innerHTML = `Відкрийте історію`;
+            textSpan.innerHTML = '<span style="font-size: 20px; line-height: 1;">⟳</span>';
+            timerDiv.title = 'Оновити таймер';
+            timerDiv.style.cursor = 'pointer';
             timerDiv.removeAttribute('data-deadline');
             if (!isFlashing) {
-                timerDiv.style.backgroundColor = '#555';
-                timerDiv.style.color = '#fff';
-                timerDiv.style.border = '1px solid #777';
+                timerDiv.style.backgroundColor = '#5c2323';
+                timerDiv.style.color = '#cfd3da';
+                timerDiv.style.border = 'none';
             }
             return;
         }
 
         if (slaData.noSLA) {
-            timerDiv.innerHTML = `Немає SLA`;
+            textSpan.textContent = 'Немає SLA';
+            textSpan.style.fontSize = '13px';
+            timerDiv.title = '';
+            timerDiv.style.cursor = 'default';
             timerDiv.removeAttribute('data-deadline');
+            if (copyBtn) copyBtn.style.display = 'none';
+            if (refreshBtn) refreshBtn.style.display = 'flex';
             if (!isFlashing) {
-                timerDiv.style.backgroundColor = '#555';
-                timerDiv.style.color = '#fff';
-                timerDiv.style.border = '1px solid #777';
+                timerDiv.style.backgroundColor = '#26282f';
+                timerDiv.style.color = '#cfd3da';
+                timerDiv.style.border = 'none';
             }
             return;
         }
 
         const { remainingMs, deadlineDate } = slaData;
         timerDiv.setAttribute('data-deadline', formatDateTime(deadlineDate));
+        timerDiv.style.cursor = 'pointer';
+        if (refreshBtn) refreshBtn.style.display = 'flex';
+        if (copyBtn) copyBtn.style.display = 'flex';
 
         const isOverdue = remainingMs < 0;
         const absDiff = Math.abs(remainingMs);
         const h = Math.floor(absDiff / (1000 * 60 * 60));
         const m = Math.floor((absDiff % (1000 * 60 * 60)) / (1000 * 60));
 
-        timerDiv.innerHTML = `${isOverdue ? '-' : ''}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+        textSpan.textContent = `${isOverdue ? '-' : ''}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+        textSpan.style.fontSize = '13px';
 
         if (!isFlashing) {
             if (remainingMs <= 2 * 60 * 60 * 1000) {
-                timerDiv.style.backgroundColor = '#4a0000';
-                timerDiv.style.color = '#ffcccc';
-                timerDiv.style.border = '1px solid #ff4d4d';
+                timerDiv.style.backgroundColor = '#4a0000'; timerDiv.style.color = '#cfd3da'; timerDiv.style.borderColor = '#ff4d4d';
             } else {
-                timerDiv.style.backgroundColor = '#26282f';
-                timerDiv.style.color = '#ccffcc';
-                timerDiv.style.border = '1px solid #33cc33';
+                timerDiv.style.backgroundColor = '#064a2c'; timerDiv.style.color = '#cfd3da'; timerDiv.style.borderColor = '#064a2c';
             }
         }
     }
 
-    // --- ЛОГІКА СТОРІНКИ СПИСКУ ЗАЯВОК ---
-    function injectListTimers() {
-        document.querySelectorAll('.p-panel-header').forEach(panel => {
-            if (panel.dataset.slaInjected) return;
+    // --- СПИСОК ЗАЯВОК: ПРИХОВУВАННЯ КОЛОНОК І ВІДНОВЛЕННЯ СІТКИ ---
+    function hideStockTimerColumns() {
+    document.querySelectorAll('.request-column').forEach(col => {
+        const prop = col.querySelector('.property-name');
 
-            const grid = panel.querySelector('.grid.align-items-start.flex-1');
-            if (!grid) return;
+        if (prop?.textContent.trim() !== 'Таймер задачі')
+            return;
 
-            let currentTicketId = null;
-            const propName = panel.querySelector('.property-name');
+        if (col.dataset.hidden)
+            return;
 
-            if (propName) {
-                const idMatch = propName.textContent.trim().match(/Заявка #(\d+)/);
-                if (idMatch) {
-                    currentTicketId = idMatch[1];
+        col.dataset.hidden = "1";
+
+        col.querySelectorAll(':scope > *:not(.request-column-resizer)').forEach(el => {
+            Object.assign(el.style, {
+                visibility: 'hidden',
+                pointerEvents: 'none'
+            });
+        });
+
+        col.style.position = 'relative';
+    });
+    }
+    const style = document.createElement('style');
+    style.textContent = `
+.request-column {
+    white-space: nowrap;
+}
+`;
+    document.head.append(style);
+
+    new MutationObserver(() => {
+        if (document.querySelector('.p-panel-header, [id$="-titlebar"]')) {
+            hideStockTimerColumns();
+        }
+    }).observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+
+    function updateListTimers() {
+        const panels = document.querySelectorAll('.p-panel-header, [id$="-titlebar"]');
+        panels.forEach(panel => {
+            let ticketId = panel.dataset.ticketId;
+            if (!ticketId) {
+                const link = panel.querySelector('a[href*="/admin/requests/"]');
+                if (link) { const m = link.href.match(/\/admin\/requests\/(\d+)/); if (m) ticketId = m[1]; }
+                if (!ticketId) {
+                    const propName = panel.querySelector('.property-name') || panel;
+                    const idMatch = propName.textContent.match(/Заявка\s*#?(\d+)/i);
+                    if (idMatch) ticketId = idMatch[1];
                 }
+                if (ticketId) panel.dataset.ticketId = ticketId;
             }
+            if (!ticketId) return;
 
-            const statusCol = Array.from(grid.children).find(c => c.textContent.includes('Статус'));
+            let statusCol = panel.querySelector('div:nth-child(2) > div > div:nth-child(2)');
+            if (!statusCol) {
+                const grid = panel.querySelector('.grid.align-items-start.flex-1');
+                if (grid) statusCol = Array.from(grid.children).find(c => c.textContent.includes('Статус'));
+            }
+            if (!statusCol) statusCol = panel;
 
-            if (statusCol && currentTicketId) {
-                statusCol.style.position = 'relative';
-                statusCol.style.overflow = 'visible';
-
-                const timerSpan = document.createElement('span');
+            let timerSpan = panel.querySelector('.list-sla-timer');
+            if (!timerSpan) {
+                statusCol.style.position = 'relative'; statusCol.style.overflow = 'visible';
+                timerSpan = document.createElement('span');
                 timerSpan.className = 'list-sla-timer';
-                timerSpan.dataset.ticketId = currentTicketId;
-
+                timerSpan.dataset.ticketId = ticketId;
                 Object.assign(timerSpan.style, {
-                    display: 'none',
-                    position: 'absolute',
-                    right: '93%',
-                    bottom: '5px',
-                    marginRight: '4px',
-                    zIndex: '10',
-                    padding: '2px 5px',
-                    borderRadius: '4px',
-                    fontSize: '11px',
-                    fontWeight: 'bold',
-                    whiteSpace: 'nowrap',
-                    border: '1px solid #555'
+                    position: 'absolute', right: '96%', bottom: '-3px', zIndex: '10',
+                    padding: '2px 5px', fontSize: '12px', fontWeight: 'bold', border: '1px solid'
                 });
-
                 statusCol.appendChild(timerSpan);
             }
 
-            panel.dataset.slaInjected = 'true';
-        });
-    }
-
-    function updateListTimers() {
-        document.querySelectorAll('.list-sla-timer').forEach(timerEl => {
-            const ticketId = timerEl.dataset.ticketId;
-            const storageKey = `slaData_${ticketId}`;
-            const savedData = localStorage.getItem(storageKey);
-
-            if (!savedData) {
-                timerEl.style.display = 'none';
-                return;
-            }
-
+            const saved = localStorage.getItem(`slaData_${ticketId}`);
+            if (!saved) { timerSpan.style.display = 'none'; return; }
+            timerSpan.style.display = '';
             try {
-                const { deadline } = JSON.parse(savedData);
-                const now = new Date().getTime();
-                const remainingMs = deadline - now;
+                const { deadline } = JSON.parse(saved);
+                const remainingMs = deadline - Date.now();
                 const isOverdue = remainingMs < 0;
                 const absDiff = Math.abs(remainingMs);
-
                 const h = Math.floor(absDiff / (1000 * 60 * 60));
                 const m = Math.floor((absDiff % (1000 * 60 * 60)) / (1000 * 60));
-
-                timerEl.textContent = `${isOverdue ? '-' : ''}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-                timerEl.style.display = 'inline-block';
+                timerSpan.textContent = `${isOverdue ? '-' : ''}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 
                 if (remainingMs <= 2 * 60 * 60 * 1000) {
-                    timerEl.style.backgroundColor = '#4a0000';
-                    timerEl.style.color = '#ffcccc';
-                    timerEl.style.borderColor = '#ff4d4d';
+                    timerSpan.style.backgroundColor = '#4a0000'; timerSpan.style.color = '#cfd3da'; timerSpan.style.borderColor = '#ff4d4d';
                 } else {
-                    timerEl.style.backgroundColor = '#26282f';
-                    timerEl.style.color = '#ccffcc';
-                    timerEl.style.borderColor = '#33cc33';
+                    timerSpan.style.backgroundColor = '#064a2c'; timerSpan.style.color = '#cfd3da'; timerSpan.style.borderColor = '#064a2c';
                 }
             } catch (e) {
-                console.error(`Помилка читання SLA для заявки ${ticketId}`, e);
+                console.error(`Помилка оновлення таймера списку для заявки ${ticketId}:`, e);
             }
         });
     }
 
-    // --- СИСТЕМА ОНОВЛЕННЯ ---
-    const observer = new MutationObserver(() => {
-        if (document.querySelector('.p-panel-header:not([data-sla-injected="true"])')) {
-            injectListTimers();
-            updateListTimers();
-        }
-
-        if (isTicketPage()) {
-            const container = document.getElementById('my-sla-container');
-            const historyActive = isHistoryTabActive();
-
-            if (container) {
-                if (container.dataset.historyActive !== String(historyActive)) {
-                    container.dataset.historyActive = String(historyActive);
-                    updateTimer();
-                }
-            } else {
-                updateTimer();
-            }
-        }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-
+    // --- ГЛАВНЫЙ ЦИКЛ (1 секунда) ---
     setInterval(() => {
-        updateTimer();
+        if (isTicketPage()) updateMainTimer();
         updateListTimers();
-    }, 60000);
+    }, 1000);
 
-    injectListTimers();
+    // Первый запуск
+    if (isTicketPage()) updateMainTimer();
     updateListTimers();
-    updateTimer();
-
+    window.addEventListener('load', () => { hideStockTimerColumns(); if (isTicketPage()) updateMainTimer(); updateListTimers(); });
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        hideStockTimerColumns();
+    }
 })();
