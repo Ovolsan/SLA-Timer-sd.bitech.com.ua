@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      20260804
-// @description  Таймер SLA для sd.bitech. Відображається на сторінці заявок коло статусу, в самій заявці в лівому меню та у списку заявок. Повністю прибирає стовпець "Таймер задачі". Вираховує час в блоці "історія", враховує критичність та всі призупинення. При кліку на таймер копіює час завершення SLA. За дві години до завершення таймера інтерфейс таймера стає червоним. Деталі в гілці discord.
+// @version      20261023
+// @description  Таймер SLA для sd.bitech. Відображається на сторінці заявок коло статусу, в самій заявці в лівому меню та у списку заявок. Повністю прибирає стовпець "Таймер задачі". Вираховує час в блоці "історія", враховує критичність та всі призупинення. Клік на таймер у заявці копіює час завершення SLA, а у списку відкриває меню копіювання та налаштування розташування. За дві години до завершення таймера інтерфейс таймера стає червоним. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bitech.com.ua
@@ -179,6 +179,8 @@
 
     // --- UI ТАЙМЕРА В ЗАЯВЦІ ---
     let autoSaveInterval = null;
+    let returnToTicketTab = null;
+    const PENDING_REFRESH_KEY = 'slaPendingRefresh';
 
     function getOrCreateTimerUI() {
         let container = document.getElementById('my-sla-container');
@@ -289,12 +291,65 @@
         return container;
     }
 
-    // --- ПЕРЕХІД В ІСТОРІЮ З АВТОЗБЕРЕЖЕННЯМ ---
+    // --- ПЕРЕХІД В ІСТОРІЮ З АВТОЗБЕРЕЖЕННЯМ І ПОВЕРНЕННЯМ ---
+    function waitForHistoryAndReturn() {
+        const pending = JSON.parse(sessionStorage.getItem(PENDING_REFRESH_KEY) || 'null');
+        if (!pending) return;
+        if (autoSaveInterval) clearInterval(autoSaveInterval);
+
+        autoSaveInterval = setInterval(() => {
+            // Не повертаємо користувача, якщо він уже відкрив іншу заявку.
+            if (getTicketId() !== pending.ticketId || Date.now() - pending.startedAt > 15000) {
+                clearInterval(autoSaveInterval);
+                autoSaveInterval = null;
+                sessionStorage.removeItem(PENDING_REFRESH_KEY);
+                returnToTicketTab = null;
+                return;
+            }
+            if (!saveSlaData(pending.ticketId)) return;
+
+            clearInterval(autoSaveInterval);
+            autoSaveInterval = null;
+            sessionStorage.removeItem(PENDING_REFRESH_KEY);
+            updateMainTimer();
+            updateListTimers();
+            console.log('[SLA Timer] SLA оновлено, повертаємося до заявки');
+
+            // Деякі вкладки перемикаються без зміни URL.
+            const previousTab = returnToTicketTab;
+            returnToTicketTab = null;
+            if (previousTab?.isConnected) {
+                previousTab.click();
+                return;
+            }
+            if (location.href === pending.returnUrl &&
+                new URL(pending.returnUrl).searchParams.get('tab') === 'requests_hstr') return;
+            const returnTab = Array.from(document.querySelectorAll('a[href]'))
+                .find(link => link.href === pending.returnUrl);
+            if (returnTab) {
+                returnTab.click();
+            } else {
+                location.href = pending.returnUrl;
+            }
+        }, 500);
+    }
+
     function navigateToHistoryAndSave() {
+        const ticketId = getTicketId();
+        if (!ticketId || autoSaveInterval) return;
+        // sessionStorage зберігає адресу повернення також при повному переході через URL.
+        sessionStorage.setItem(PENDING_REFRESH_KEY, JSON.stringify({
+            ticketId, returnUrl: location.href, startedAt: Date.now()
+        }));
+        returnToTicketTab = document.querySelector(
+            '.dpl-aside-tab[aria-current="true"], .dpl-aside-tab.dpl-aside-link-active, ' +
+            '.p-tabview-selected .p-tabview-nav-link, .p-highlight .p-tabview-nav-link, ' +
+            '.p-tabview-nav-link[aria-selected="true"], a[role="tab"][aria-selected="true"], .nav-link.active'
+        );
         console.log('[SLA Timer] Перехід на вкладку Історія...');
-        let tab = document.querySelector('a[href*="tab=requests_hstr"]');
+        let tab = document.querySelector('.dpl-aside-tab[aria-label="Історія"], a[href*="tab=requests_hstr"]');
         if (!tab) {
-            const candidates = document.querySelectorAll('.p-tabview-nav-link, .nav-link, a[role="tab"], li[role="presentation"] a');
+            const candidates = document.querySelectorAll('.dpl-aside-tab, .p-tabview-nav-link, .nav-link, a[role="tab"], li[role="presentation"] a');
             for (let t of candidates) {
                 if (t.textContent.trim() === 'Історія' || t.textContent.trim() === 'История') {
                     tab = t;
@@ -302,26 +357,9 @@
                 }
             }
         }
+        waitForHistoryAndReturn();
         if (tab) {
             tab.click();
-            let attempts = 0;
-            if (autoSaveInterval) clearInterval(autoSaveInterval);
-            autoSaveInterval = setInterval(() => {
-                const id = getTicketId();
-                if (parseHistoryData() && saveSlaData(id)) {
-                    clearInterval(autoSaveInterval);
-                    autoSaveInterval = null;
-                    console.log('[SLA Timer] Автоматичне збереження SLA виконано');
-                    updateMainTimer();
-                    updateListTimers();
-                }
-                attempts++;
-                if (attempts > 20) {
-                    clearInterval(autoSaveInterval);
-                    autoSaveInterval = null;
-                    console.warn('[SLA Timer] Не вдалося автоматично зберегти SLA після переходу');
-                }
-            }, 500);
         } else {
             console.warn('[SLA Timer] Вкладку не знайдено, переходимо через URL');
             const url = new URL(location);
@@ -340,18 +378,19 @@
         }
 
         const aside = document.querySelector('aside.dpl-aside');
-        const group = aside?.querySelector('.dpl-aside-group:nth-child(2)') ?? aside?.querySelector('.dpl-aside-group');
-        if (group && !group.contains(container)) {
-            container.style.margin = '15px 0';
+        const group = aside?.querySelector('.dpl-aside-tab[aria-label="Заявка"]')
+            ?.closest('.dpl-aside-group');
+        if (group && group.firstElementChild !== container) {
+            container.style.margin = '0';
             container.style.flexDirection = 'column';
-            container.style.gap = '8px';
+            container.style.gap = '0';
             container.style.width = '100%';
             container.style.padding = '0';
             container.style.boxSizing = 'border-box';
-            container.style.flex = '1 1 auto';
+            container.style.flex = '0 0 auto';
             const timerDiv = container.querySelector('#my-sla-timer');
             if (timerDiv) { timerDiv.style.width = '100%'; timerDiv.style.padding = '0'; }
-            group.appendChild(container);
+            group.prepend(container);
         }
         container.style.display = 'flex';
 
@@ -477,7 +516,210 @@
     });
 
 
+    // --- МЕНЮ ТА РОЗТАШУВАННЯ ТАЙМЕРІВ У СПИСКУ ---
+    const LIST_LAYOUT_KEY = 'slaListTimerLayout';
+    const LIST_LAYOUT_FIELDS = {
+        x: { label: 'По горизонталі', min: -400, max: 400, value: 0, unit: 'пкс' },
+        y: { label: 'По вертикалі', min: -120, max: 120, value: 0, unit: 'пкс' },
+        width: { label: 'Ширина', min: 40, max: 180, value: 56, unit: 'пкс' },
+        height: { label: 'Висота', min: 16, max: 64, value: 22, unit: 'пкс' },
+        fontSize: { label: 'Розмір тексту', min: 8, max: 24, value: 12, unit: 'пкс' }
+    };
+    function readListTimerLayout() {
+        let saved;
+        try { saved = JSON.parse(localStorage.getItem(LIST_LAYOUT_KEY)); } catch (e) {}
+        return Object.fromEntries(Object.entries(LIST_LAYOUT_FIELDS).map(([key, field]) => {
+            const value = saved?.[key];
+            return [key, Number.isFinite(value)
+                ? Math.max(field.min, Math.min(field.max, Math.round(value))) : field.value];
+        }));
+    }
+    let listTimerLayout = readListTimerLayout();
+    let listTimerPopup = null;
+
+    function applyListTimerLayout(timer) {
+        const { x, y, width, height, fontSize } = listTimerLayout;
+        // Абсолютне позиціювання виключає таймер з розрахунку висоти рядка.
+        Object.assign(timer.style, {
+            position: 'absolute', right: '96%', bottom: '-3px', zIndex: '10',
+            transform: `translate(${x}px, ${y}px)`, width: `${width}px`, height: `${height}px`,
+            boxSizing: 'border-box', padding: '2px 5px', margin: '0',
+            fontSize: `${fontSize}px`, fontWeight: 'bold', lineHeight: '1',
+            borderWidth: '1px', borderStyle: 'solid', borderRadius: '0', display: 'inline-flex',
+            alignItems: 'center', justifyContent: 'center', whiteSpace: 'nowrap',
+            overflow: 'hidden', cursor: 'pointer', userSelect: 'none'
+        });
+    }
+
+    function openListTimerMenu(timer) {
+        listTimerPopup?.close(false);
+        const controller = new AbortController();
+        const { signal } = controller;
+        const host = document.createElement('div');
+        host.id = 'sla-list-timer-popup';
+        host.lang = 'uk';
+        // Shadow DOM захищає меню від глобальних стилів div/button/span у Stylus.
+        host.style.cssText = 'position:fixed;inset:0;width:0;height:0;z-index:2147483000;';
+        host.style.setProperty('background', 'transparent', 'important');
+        const root = host.attachShadow({ mode: 'open' });
+        root.innerHTML = `
+            <style>
+                :host { font:13px sans-serif; color:#c8c3bc; }
+                *, *::before, *::after { box-sizing:border-box; }
+                .panel { position:fixed; width:224px; max-width:calc(100vw - 16px);
+                    max-height:calc(100dvh - 16px); overflow:auto; padding:4px; margin:0;
+                    background:#272a2c; color:#c8c3bc; border:1px solid #3e4446; border-radius:0; }
+                .panel.editor { width:304px; padding:10px; }
+                button { font:inherit; color:inherit; background:transparent; border:0;
+                    border-radius:0; margin:0; padding:7px 8px; cursor:pointer; }
+                button:hover { background:#35393b; }
+                button:focus-visible, input:focus-visible { outline:2px solid #86b9ff; outline-offset:-2px; }
+                .action { display:flex; align-items:center; gap:9px; width:100%; text-align:left; }
+                svg { flex:none; width:17px; height:17px; fill:none; stroke:currentColor;
+                    stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+                header, .caption, footer { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+                h2 { font:700 13px sans-serif; margin:0; }
+                .close { padding:3px; display:flex; }
+                .note, .status { color:#9d9588; font-size:12px; line-height:1.4; margin:6px 0; }
+                .status:empty { display:none; }
+                .status[data-error] { color:#ffb7be; }
+                label { display:block; margin:14px 0; }
+                output { color:#b8c0ca; font-variant-numeric:tabular-nums; }
+                input[type=range] { display:block; width:100%; height:18px; margin:5px 0 0;
+                    padding:0; accent-color:#86b9ff; cursor:pointer; }
+                footer { border-top:1px solid #3e4446; padding-top:8px; }
+                .primary { background:#1e3a60; color:#e8e6e3; }
+                .primary:hover { background:#284b79; }
+            </style>
+            <section class="panel" role="menu" aria-label="SLA">
+                <button class="action" type="button" role="menuitem" data-action="copy">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13"/><path d="M16 8V3H3v13h5"/></svg>
+                    Копіювати SLA
+                </button>
+                <button class="action" type="button" role="menuitem" data-action="edit">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>
+                    Редагувати розташування
+                </button>
+                <p class="status" role="status" aria-live="polite"></p>
+            </section>`;
+        const panel = root.querySelector('.panel');
+        const anchor = timer.getBoundingClientRect();
+        let copyTimeout;
+        function close(restoreFocus = true) {
+            clearTimeout(copyTimeout);
+            controller.abort();
+            host.remove();
+            timer.setAttribute('aria-expanded', 'false');
+            if (restoreFocus && timer.isConnected) timer.focus({ preventScroll: true });
+            if (listTimerPopup?.host === host) listTimerPopup = null;
+        }
+        function positionPanel() {
+            const rect = panel.getBoundingClientRect();
+            panel.style.left = `${Math.max(8, Math.min(anchor.left, window.innerWidth - rect.width - 8))}px`;
+            const top = anchor.bottom + 6;
+            panel.style.top = `${Math.max(8, Math.min(top, window.innerHeight - rect.height - 8))}px`;
+        }
+        function showStatus(text, error = false) {
+            const status = panel.querySelector('.status');
+            status.textContent = text;
+            status.toggleAttribute('data-error', error);
+            positionPanel();
+        }
+        function saveLayout() {
+            document.querySelectorAll('.list-sla-timer').forEach(item => {
+                if (item.style.display !== 'none') applyListTimerLayout(item);
+            });
+            try {
+                localStorage.setItem(LIST_LAYOUT_KEY, JSON.stringify(listTimerLayout));
+                showStatus('Зміни збережено');
+            } catch (e) { showStatus('Не вдалося зберегти налаштування в браузері', true); }
+        }
+        function openEditor() {
+            clearTimeout(copyTimeout);
+            panel.classList.add('editor');
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-label', 'Розташування таймерів SLA');
+            panel.innerHTML = `
+                <header><h2>Розташування таймерів SLA</h2>
+                    <button class="close" type="button" aria-label="Закрити">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+                    </button>
+                </header>
+                <p class="note">Для всіх таймерів списку. Зміни видно одразу, вони зберігаються автоматично.</p>
+                ${Object.entries(LIST_LAYOUT_FIELDS).map(([key, field]) => `
+                    <label for="sla-layout-${key}">
+                        <span class="caption"><span>${field.label}</span><output for="sla-layout-${key}">${listTimerLayout[key]} ${field.unit}</output></span>
+                        <input id="sla-layout-${key}" type="range" data-key="${key}" min="${field.min}" max="${field.max}" step="1" value="${listTimerLayout[key]}">
+                    </label>`).join('')}
+                <p class="note">Розмір таймера не змінює висоту рядка.</p>
+                <p class="status" role="status" aria-live="polite"></p>
+                <footer><button type="button" data-action="reset">Скинути</button>
+                    <button class="primary" type="button" data-action="done">Готово</button></footer>`;
+            panel.querySelector('.close').addEventListener('click', () => close(), { signal });
+            panel.querySelector('[data-action=done]').addEventListener('click', () => close(), { signal });
+            panel.querySelectorAll('input').forEach(input => {
+                input.addEventListener('input', () => {
+                    listTimerLayout[input.dataset.key] = Number(input.value);
+                    input.labels[0].querySelector('output').textContent = `${input.value} пкс`;
+                    saveLayout();
+                }, { signal });
+            });
+            panel.querySelector('[data-action=reset]').addEventListener('click', () => {
+                for (const [key, field] of Object.entries(LIST_LAYOUT_FIELDS)) {
+                    listTimerLayout[key] = field.value;
+                    const input = panel.querySelector(`[data-key=${key}]`);
+                    input.value = field.value;
+                    input.labels[0].querySelector('output').textContent = `${field.value} ${field.unit}`;
+                }
+                saveLayout();
+            }, { signal });
+            positionPanel();
+            panel.querySelector('input').focus();
+        }
+        panel.querySelector('[data-action=copy]').addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(timer.dataset.deadline);
+                if (signal.aborted) return;
+                showStatus('SLA скопійовано');
+                copyTimeout = setTimeout(() => close(), 800);
+            } catch (e) {
+                if (!signal.aborted) showStatus('Не вдалося скопіювати SLA. Спробуйте ще раз.', true);
+            }
+        }, { signal });
+        panel.querySelector('[data-action=edit]').addEventListener('click', openEditor, { signal });
+        document.addEventListener('pointerdown', event => {
+            if (!event.composedPath().includes(host)) close(false);
+        }, { capture: true, signal });
+        document.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+        }, { capture: true, signal });
+        panel.addEventListener('keydown', event => {
+            if (panel.getAttribute('role') !== 'menu') return;
+            const items = Array.from(panel.querySelectorAll('[role=menuitem]'));
+            const index = items.indexOf(root.activeElement);
+            if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+                event.preventDefault();
+                const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+                    : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+                items[next].focus();
+            }
+        }, { signal });
+        document.addEventListener('focusin', event => {
+            if (!event.composedPath().includes(host) && event.target !== timer) close(false);
+        }, { signal });
+        window.addEventListener('resize', () => close(false), { signal });
+        window.addEventListener('scroll', event => {
+            if (!event.composedPath().includes(host)) close(false);
+        }, { capture: true, signal });
+        document.body.append(host);
+        listTimerPopup = { host, timer, close };
+        timer.setAttribute('aria-expanded', 'true');
+        positionPanel();
+        panel.querySelector('button').focus({ preventScroll: true });
+    }
+
     function updateListTimers() {
+        if (listTimerPopup && !listTimerPopup.timer.isConnected) listTimerPopup.close(false);
         const panels = document.querySelectorAll('.p-panel-header, [id$="-titlebar"]');
         panels.forEach(panel => {
             let ticketId = panel.dataset.ticketId;
@@ -506,19 +748,31 @@
                 timerSpan = document.createElement('span');
                 timerSpan.className = 'list-sla-timer';
                 timerSpan.dataset.ticketId = ticketId;
-// ТУТ НАЛАШТОВУЄМО ДИЗАЙН ТА РОЗТАШУВАННЯ ТАЙМЕРА В СПИСКУ ЗАЯВОК
-                Object.assign(timerSpan.style, {
-                    position: 'absolute', right: '96%', bottom: '-3px', zIndex: '10',
-                    padding: '2px 5px', fontSize: '12px', fontWeight: 'bold', border: '1px solid'
+                timerSpan.setAttribute('role', 'button');
+                timerSpan.tabIndex = 0;
+                timerSpan.setAttribute('aria-haspopup', 'menu');
+                timerSpan.setAttribute('aria-expanded', 'false');
+                timerSpan.title = 'Меню SLA';
+                const openMenu = event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    openListTimerMenu(timerSpan);
+                };
+                timerSpan.addEventListener('click', openMenu);
+                timerSpan.addEventListener('contextmenu', openMenu);
+                timerSpan.addEventListener('keydown', event => {
+                    if (['Enter', ' ', 'ContextMenu'].includes(event.key) || (event.shiftKey && event.key === 'F10')) openMenu(event);
                 });
                 statusCol.appendChild(timerSpan);
             }
 
             const saved = localStorage.getItem(`slaData_${ticketId}`);
             if (!saved) { timerSpan.style.display = 'none'; return; }
-            timerSpan.style.display = '';
+            applyListTimerLayout(timerSpan);
             try {
                 const { deadline } = JSON.parse(saved);
+                timerSpan.dataset.deadline = formatDateTime(new Date(deadline));
+                timerSpan.setAttribute('aria-label', `SLA заявки ${ticketId}: ${timerSpan.dataset.deadline}. Відкрити меню`);
                 const remainingMs = deadline - Date.now();
                 const isOverdue = remainingMs < 0;
                 const absDiff = Math.abs(remainingMs);
@@ -542,6 +796,9 @@
         if (isTicketPage()) updateMainTimer();
         updateListTimers();
     }, 1000);
+
+    // Продовжуємо оновлення після переходу в історію з перезавантаженням сторінки.
+    waitForHistoryAndReturn();
 
     // Первый запуск
     if (isTicketPage()) updateMainTimer();
