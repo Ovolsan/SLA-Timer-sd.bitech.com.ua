@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SLA Timer sd.bitech.com.ua
 // @namespace    http://tampermonkey.net/
-// @version      20261116
+// @version      20261119
 // @description  Таймер SLA для sd.bitech. Бере таймер SLA напряму з API сайту — те саме значення, що й стандартна колонка «Таймер задачі», тому коректно враховує критичність, усі призупинення, їх дострокове зняття та зв'язані заявки. Відображається у списку заявок коло статусу для всіх заявок і в самій заявці над лівим меню, оновлюється щохвилини. Показує фактичний час до дедлайну. Клік на таймер у заявці копіює час завершення SLA, а у списку відкриває меню копіювання та налаштування розташування. За дві години до завершення таймер стає червоним. Деталі в гілці discord.
 // @author       Ovolya
 // @match        *://sd.bitech.com.ua/*
@@ -17,10 +17,11 @@
 
     // --- КОНСТАНТИ ---
     const API_PATH = '/app';
-    const LIST_PATH = '/admin/requests';
     const REFRESH_INTERVAL_MS = 60 * 1000;
     const DANGER_THRESHOLD_MS = 2 * 60 * 60 * 1000;
     const TOKEN_EXPIRY_MARGIN_MS = 15 * 1000;
+    const STARTUP_GRACE_MS = 1500; // спершу даємо сайту завантажити дані самому
+    const MISSING_RETRY_MS = 5 * 1000;
     const STATUS_CLOSED = 5; // «Закрита»
     const TEXT_COLOR = '#cfd3da';
     const MAIN_TIMER_FONT_SIZE = '15px';
@@ -81,10 +82,13 @@
     // (статус «Відстрочено» — до зміни статусу або до автоматичного відновлення) та зв'язані
     // заявки. Скрипт не рахує SLA сам, а лише показує ці дані.
     const slaStore = new Map();
+    const unavailableIds = new Set(); // заявки, яких сайт не повернув на запит за номером
+    const startedAt = Date.now();
     let authorization = null; // токен доступу самого сайту: лише в пам'яті сторінки, нікуди не зберігається
     let authorizationExpiresAt = 0;
-    let lastListRequest = null;
+    let pendingSiteRequests = 0;
     let lastRefreshAttemptAt = 0;
+    let lastOwnTokenAt = 0;
     let refreshPromise = null;
     let lastRefreshError = '';
 
@@ -103,37 +107,6 @@
         return true;
     }
 
-    // Повертає кількість заявок із даними SLA у відповіді API.
-    function rememberApiResponse(response) {
-        let json = response;
-        if (typeof response === 'string') {
-            if (!response.includes('"sla_timer"')) return 0;
-            try { json = JSON.parse(response); } catch (e) { return 0; }
-        }
-        const data = json?.data;
-        const receivedAt = Date.now();
-        return (Array.isArray(data) ? data : [data])
-            .reduce((count, item) => count + (rememberTicket(item, receivedAt) ? 1 : 0), 0);
-    }
-
-    function handleApiExchange(requestBody, response, path) {
-        if (!rememberApiResponse(response) || path !== LIST_PATH || typeof requestBody !== 'string') return;
-        // Запам'ятовуємо запит списку, щоб щохвилини повторювати саме його (ті самі фільтри й сторінка).
-        try {
-            const request = JSON.parse(requestBody);
-            if (request?.module === 'requests' && request.action === 'readMany') {
-                lastListRequest = { body: requestBody, receivedAt: Date.now() };
-            }
-        } catch (e) {}
-    }
-
-    function isApiUrl(url) {
-        try {
-            const parsed = new URL(url, location.href);
-            return parsed.origin === location.origin && parsed.pathname === API_PATH;
-        } catch (e) { return false; }
-    }
-
     function rememberAuthorization(value) {
         if (typeof value !== 'string' || !/^Bearer\s+\S/i.test(value)) return;
         authorization = value;
@@ -145,7 +118,29 @@
         } catch (e) {}
     }
 
-    // Скрипт запускається до завантаження сайту й читає відповіді, які сайт і так отримує.
+    // Читає з відповіді API дані SLA заявок і новий токен доступу, якщо вони там є.
+    function handleApiResponse(response) {
+        let json = response;
+        if (typeof response === 'string') {
+            if (!response.includes('"sla_timer"') && !response.includes('"accessToken"')) return null;
+            try { json = JSON.parse(response); } catch (e) { return null; }
+        }
+        const token = json?.data?.accessToken ?? json?.accessToken;
+        if (typeof token === 'string') rememberAuthorization(`Bearer ${token}`);
+        const data = json?.data;
+        const receivedAt = Date.now();
+        (Array.isArray(data) ? data : [data]).forEach(item => rememberTicket(item, receivedAt));
+        return json;
+    }
+
+    function isApiUrl(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            return parsed.origin === location.origin && parsed.pathname === API_PATH;
+        } catch (e) { return false; }
+    }
+
+    // Читаємо відповіді, які сайт і так отримує, — так дані з'являються без зайвих запитів.
     function installApiCapture() {
         const proto = XMLHttpRequest.prototype;
         const nativeOpen = proto.open;
@@ -161,15 +156,15 @@
             if (apiRequests.has(this) && String(name).toLowerCase() === 'authorization') rememberAuthorization(value);
             return nativeSetRequestHeader.apply(this, arguments);
         };
-        proto.send = function (body) {
+        proto.send = function () {
             if (apiRequests.has(this)) {
-                const path = location.pathname;
+                pendingSiteRequests++;
+                this.addEventListener('loadend', () => { pendingSiteRequests--; }, { once: true });
                 this.addEventListener('load', () => {
                     if (this.status !== 200) return;
                     try {
                         const type = this.responseType;
-                        const response = type === '' || type === 'text' ? this.responseText : type === 'json' ? this.response : null;
-                        handleApiExchange(body, response, path);
+                        handleApiResponse(type === '' || type === 'text' ? this.responseText : type === 'json' ? this.response : null);
                     } catch (e) { console.warn('[SLA Timer] Не вдалося прочитати відповідь сайту:', e); }
                 });
             }
@@ -183,11 +178,11 @@
                 const isRequest = input instanceof Request;
                 if (isApiUrl(isRequest ? input.url : String(input))) {
                     rememberAuthorization(new Headers(init?.headers ?? (isRequest ? input.headers : undefined)).get('authorization'));
-                    const body = typeof init?.body === 'string' ? init.body : null;
-                    const path = location.pathname;
+                    pendingSiteRequests++;
                     promise.then(response => response.ok ? response.clone().text() : null)
-                        .then(text => { if (text) handleApiExchange(body, text, path); })
-                        .catch(() => {});
+                        .then(text => { if (text) handleApiResponse(text); })
+                        .catch(() => {})
+                        .finally(() => { pendingSiteRequests--; });
                 }
             } catch (e) {}
             return promise;
@@ -202,44 +197,64 @@
             (!authorizationExpiresAt || authorizationExpiresAt - Date.now() > TOKEN_EXPIRY_MARGIN_MS);
     }
 
-    // Лише читання: ті самі запити, що робить сайт, без жодних змін у заявках.
-    async function callApi(body) {
-        const headers = {
-            'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*', Authorization: authorization
-        };
+    // Лише читання, без жодних змін у заявках.
+    async function postApi(payload, withAuthorization) {
+        const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/plain, */*' };
+        if (withAuthorization) headers.Authorization = authorization;
         const xsrf = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]*)/);
         if (xsrf) headers['X-XSRF-TOKEN'] = decodeURIComponent(xsrf[1]);
-        const path = location.pathname;
-        const response = await nativeFetch.call(window, API_PATH, { method: 'POST', credentials: 'same-origin', headers, body });
-        if (response.status === 401) authorization = null;
+        const response = await nativeFetch.call(window, API_PATH, {
+            method: 'POST', credentials: 'same-origin', headers, body: JSON.stringify(payload)
+        });
+        if (response.status === 401 && withAuthorization) authorization = null;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        handleApiExchange(body, await response.text(), path);
+        return handleApiResponse(await response.text());
     }
 
-    function refreshSlaData(force = false) {
+    // Якщо скрипт запустився пізніше за перші запити сайту, токена в нього немає.
+    // Тоді беремо його так само, як сайт при кожному відкритті вкладки.
+    async function obtainOwnAuthorization() {
+        if (Date.now() - lastOwnTokenAt < REFRESH_INTERVAL_MS) return false;
+        lastOwnTokenAt = Date.now();
+        await postApi({ module: 'admin', action: 'refreshAccessToken' }, false);
+        return canCallApi();
+    }
+
+    // Один запит на всі видимі заявки — за номерами, тому не залежить від фільтрів списку.
+    async function loadSla(ids, allowOwnAuthorization) {
+        if (!canCallApi() && !(allowOwnAuthorization && await obtainOwnAuthorization())) {
+            throw new Error('немає доступу до API сайту');
+        }
+        for (let i = 0; i < ids.length; i += 100) {
+            const chunk = ids.slice(i, i + 100);
+            const json = await postApi({
+                module: 'requests', action: 'readMany',
+                data: { requestTxtFormat: 'text/plain', requestStatustxtFormatted: true },
+                filter: { id: chunk.join(','), id_fo: 'IN_CSV_ARRAY' },
+                pagination: { currPage: 1, pageSize: chunk.length }
+            }, true);
+            const returned = new Set((Array.isArray(json?.data) ? json.data : []).map(item => String(item?.id)));
+            chunk.forEach(id => { if (!returned.has(id)) unavailableIds.add(id); });
+        }
+    }
+
+    function refreshSlaData(ids, force = false) {
         if (refreshPromise) return refreshPromise;
-        const ticketId = getTicketId();
-        let body = null;
-        let dataAt = 0;
-        if (ticketId) {
-            body = JSON.stringify({ module: 'requests', action: 'readOne', data: { id: Number(ticketId) } });
-            dataAt = slaStore.get(ticketId)?.receivedAt ?? 0;
-        } else if (location.pathname === LIST_PATH && lastListRequest) {
-            ({ body, receivedAt: dataAt } = lastListRequest);
-        }
-        if (!body) return Promise.resolve(false);
+        if (!ids.length || (!force && document.visibilityState === 'hidden')) return Promise.resolve(false);
         const now = Date.now();
-        if (!force && (document.visibilityState === 'hidden' || now - dataAt < REFRESH_INTERVAL_MS ||
-            now - lastRefreshAttemptAt < REFRESH_INTERVAL_MS)) return Promise.resolve(false);
-        if (!canCallApi()) {
-            if (force) lastRefreshError = 'Не вдалося оновити: сайт ще не видав доступ. Виконайте будь-яку дію на сайті або оновіть сторінку.';
-            return Promise.resolve(false);
-        }
+        const missing = ids.some(id => !slaStore.has(id) && !unavailableIds.has(id));
+        const stale = ids.some(id => slaStore.has(id) && now - slaStore.get(id).receivedAt >= REFRESH_INTERVAL_MS);
+        // Поки сайт сам завантажує дані, не дублюємо його запити.
+        const siteBusy = pendingSiteRequests > 0 || now - startedAt < STARTUP_GRACE_MS;
+        const due = force ||
+            (missing && !siteBusy && now - lastRefreshAttemptAt >= MISSING_RETRY_MS) ||
+            (stale && now - lastRefreshAttemptAt >= REFRESH_INTERVAL_MS);
+        if (!due) return Promise.resolve(false);
         lastRefreshAttemptAt = now;
-        refreshPromise = callApi(body)
-            .then(() => { lastRefreshError = ''; return true; }, error => {
+        refreshPromise = loadSla(ids, missing || force)
+            .then(() => { lastRefreshError = ''; setTimeout(tick, 0); return true; }, error => {
                 console.warn('[SLA Timer] Не вдалося оновити дані SLA:', error);
-                if (force) lastRefreshError = 'Не вдалося оновити дані SLA. Спробуйте ще раз або оновіть сторінку.';
+                if (force || missing) lastRefreshError = 'Не вдалося отримати дані SLA. Спроба повториться автоматично.';
                 return false;
             })
             .finally(() => { refreshPromise = null; });
@@ -317,7 +332,7 @@
     }
 
     function refreshNow() {
-        refreshSlaData(true).then(tick);
+        refreshSlaData(visibleTicketIds, true).then(tick);
     }
 
     function createMainTimer() {
@@ -667,7 +682,7 @@
         return timer;
     }
 
-    function updateListTimers(now) {
+    function updateListTimers(now, visibleIds) {
         if (listTimerPopup && !listTimerPopup.timer.isConnected) listTimerPopup.close(false);
         document.querySelectorAll('.p-panel-header, [id$="-titlebar"]').forEach(panel => {
             const ticketId = getPanelTicketId(panel);
@@ -676,6 +691,7 @@
                 if (timer) setStyle(timer, 'display', 'none');
                 return;
             }
+            visibleIds.add(ticketId);
             timer ??= createListTimer(panel);
             setData(timer, 'ticketId', ticketId);
 
@@ -699,12 +715,17 @@
 
     // --- ГОЛОВНИЙ ЦИКЛ ---
     let lastTickError = '';
+    let visibleTicketIds = [];
     function tick() {
         try {
             const now = Date.now();
+            const ids = new Set();
+            const ticketId = getTicketId();
+            if (ticketId) ids.add(ticketId);
             updateMainTimer(now);
-            updateListTimers(now);
-            refreshSlaData();
+            updateListTimers(now, ids);
+            visibleTicketIds = [...ids];
+            refreshSlaData(visibleTicketIds);
         } catch (e) {
             if (String(e) !== lastTickError) console.error('[SLA Timer]', e);
             lastTickError = String(e);
